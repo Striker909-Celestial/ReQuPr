@@ -1,6 +1,6 @@
 import asyncio
 
-from requp import ReQup
+from requpr import ReQuPr
 from processor import Processor
 import numpy
 
@@ -15,8 +15,8 @@ rand_processor = Processor("rand", rand, {"min": -10, "max": 11})
 add_processor = Processor("add", add, {"a": "@rand|add|mul", "b": "@rand|add|mul"})
 mul_processor = Processor("mul", mul, {"a": "@rand|add|mul", "b": "@rand|add|mul"})
 
-requp = ReQup({"rand": rand_processor, "add": add_processor, "mul": mul_processor},
-              {"rand": 4, "add": 2, "mul": 2}, {"add": 1000, "mul": 1000})
+requp = ReQuPr({"rand": rand_processor, "add": add_processor, "mul": mul_processor},
+               {"rand": 4, "add": 2, "mul": 2}, {"add": 1000, "mul": 1000})
 
 requp.start_daemons()
 asyncio.run(requp.working_loop(), debug=True)

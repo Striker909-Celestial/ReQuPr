@@ -7,7 +7,7 @@ from processor import Processor
 from request import Request
 from buffer import BufferGroup
 
-class ReQup:
+class ReQuPr:
 
 	def __init__(self, processors: dict[str, Processor], processor_counts: dict[str, int],
 				 output_targets: dict[str, int],
