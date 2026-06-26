@@ -1,5 +1,7 @@
 from collections.abc import Callable
 
+from data_signal import Token
+
 
 class Processor:
     """
@@ -74,4 +76,4 @@ class Processor:
             return self.name, None
         kwargs = self.function_kwargs.copy()
         kwargs.update(dependency_inputs)
-        return self.name, self.function(**kwargs)
+        return Token(self.name, self.function(**kwargs))

@@ -2,12 +2,12 @@ import asyncio
 import multiprocessing
 import datetime
 
-from collections.abc import Callable
-from multiprocessing import Queue
+from multiprocessing import Queue, Manager
+from multiprocessing.managers import SyncManager
 from func_timeout import func_timeout
 
 from processor import Processor
-from request import Request
+from data_signal import Token, Request, Response
 
 class Buffer:
 	"""
@@ -15,33 +15,34 @@ class Buffer:
 	fulfill requests.
 	"""
 
-	def __init__(self, processor: Processor, n: int, fallback_send: Callable[tuple], max_process_wait=1.0):
+	def __init__(self, processor: Processor, n: int, output_queue: Queue[Token], available_buffers_queue: Queue[str], working_buffers_set, max_process_wait=1.0, idle_interval: float = 0.5):
 		"""
 		A wrapper for a Processor that contains buffers to store inputs for the processor and uses the outputs of the Processor to fulfill requests.
 		:param processor: The Processor to use as the underlying processor for this buffer.
 		:param n: An integer to identify this buffer.
-		:param fallback_send: A function that the output of the processor will be fed into if there is no request to fulfill. This function should send the output into an external storage buffer to be used later.
+		:param output_queue: The queue for this buffer to output to.
 		:param max_process_wait: The maximum amount of time in seconds the buffer should allow the processor to process for before timing out.
 		"""
 		self.processor = processor
 		self.n = n
 		self.name = self.processor.name + "~" + str(n)
 
-		self.active = True
-
-		self.request: Request | None = None
-		self.requested = False
-		self.fallback_send = fallback_send
-
 		self.max_process_wait = max_process_wait
+		self.idle_interval = idle_interval
 
-		self.input_queue = Queue()
-		self.input_storage: Queue[tuple] = Queue()
+		self.active = True
+		self.requested = False
+
+		self.output_queue = output_queue
+		self.available_buffers_queue = available_buffers_queue
+		self.working_buffers_set = working_buffers_set
+
+		self.input_queue: Queue[Token] = Queue()
+		self.input_storage: Queue[Token] = Queue()
 
 		self.current_dependencies = self.processor.dependencies.copy()
 		self.current_dependencies_map = {key: val.copy() for key, val in self.processor.dependencies_map.items()}
 		self.input_buffer = {}
-		self.request_sent = False
 		self.total_time = 0.0
 		self.num_calls = 0
 
@@ -59,27 +60,6 @@ class Buffer:
 		"""
 		return len(self.input_buffer)
 
-	def push_request(self, request: Request) -> bool:
-		"""
-		Provides a request to this buffer to be fulfilled.
-		:param request: The request for this buffer to fulfill.
-		:return: False if this buffer is already fulfilling a request, true otherwise.
-		"""
-		if self.requested:
-			return False
-		self.requested = True
-		self.request = request
-		self.request.add_fulfilled_func(self.remove_request)
-		self.process_buffer()
-		return True
-
-	def remove_request(self):
-		"""
-		Stops this buffer from fulfilling the current request if there is a request the buffer is fulfilling.
-		"""
-		self.requested = False
-		self.request = None
-
 	def process_buffer(self) -> bool | None:
 		"""
 		Attempts to run the processor on the buffer's contents.
@@ -91,46 +71,37 @@ class Buffer:
 		start = datetime.datetime.now()
 		self.current_dependencies = self.processor.dependencies.copy()
 		self.current_dependencies_map = {key: val.copy() for key, val in self.processor.dependencies_map.items()}
+		output = Token(self.processor.name, None)
 		try:
 			output = func_timeout(self.max_process_wait, self.processor.process, self.input_buffer)
 		except TimeoutError:
-			self.total_time += (datetime.datetime.now() - start).total_seconds()
-			return None
+			pass
 		self.num_calls += 1
-		if self.requested and self.request is not None:
-			self.request.fulfill(output)
-			self.requested = False
-			self.request = None
-		else:
-			self.fallback_send(output)
+		self.output_queue.put(output)
+		self.available_buffers_queue.put(self.name)
+		self.working_buffers_set.remove(self.name)
 		self.input_buffer = {}
 		self.push_storage()
 		self.total_time += (datetime.datetime.now() - start).total_seconds()
-		if self.count() == self.size():
-			self.process_buffer()
 		return True
 
-	def receive_token(self, token: tuple) -> bool:
+	def receive_token(self, token: Token):
 		"""
-
-		:return: If the token was successfully received.
+		Adds a token to this buffer's input queue.
+		:param token: The token to add to the input queue.
 		"""
-		if token[1] is None:
-			# Returns false if the token's value is none
-		    return False
 		self.input_queue.put(token)
-		return True
 
-	def push_token(self, token: tuple):
+	def push_token(self, token: Token):
 		"""
-		Attempts to push a token into the input buffer for the post processor. If the token is not needed immediately, it will instead
+		Attempts to push a token into the input buffer for the processor. If the token is not needed immediately, it will instead
 		be moved to storage to be used in a future run of the processor.
 		:param token: The token to be pushed.
 		:return: If the token was successfully pushed to the input buffer or storage.
 		"""
-		token_source = token[0]
+		token_source = token.source
 		if token_source not in self.current_dependencies:
-			# Puts the token into storage for a future operation if it is not currently needed
+			# Puts the token into storage for a future operation if it is not currently necessary
 			self.input_storage.put(token)
 			return True
 		start = datetime.datetime.now()
@@ -142,7 +113,7 @@ class Buffer:
 			if len(self.current_dependencies_map[dep]) == 0:
 				self.current_dependencies.remove(dep)
 		# Places the token's data in the buffer
-		self.input_buffer[kw] = token[1]
+		self.input_buffer[kw] = token.data
 		self.total_time += (datetime.datetime.now() - start).total_seconds()
 
 		return True
@@ -175,24 +146,25 @@ class Buffer:
 		self.active = False
 
 	async def idle(self, idle_interval: float):
-		while self.count() < self.size():
-			if not self.active:
-				return
-
+		while (self.active
+				and ((self.count() < self.size()
+				and self.input_queue.qsize() == 0)
+				or self.name not in self.working_buffers_set)):
 			await asyncio.sleep(idle_interval)
 
-			if self.input_queue.qsize() != 0:
-				return
-		return
-
-	async def working_loop(self, idle_interval: float):
+	async def working_loop(self):
 		while self.active:
 			self.push_input_queue()
-			self.process_buffer()
+			if self.name in self.working_buffers_set:
+				self.process_buffer()
 
-			await self.idle(idle_interval)
+			await self.idle(self.idle_interval)
 		self.push_input_queue()
 		self.process_buffer()
+
+	@staticmethod
+	def run_working_loop(buffer: Buffer):
+		asyncio.run(buffer.working_loop())
 
 class BufferGroup:
 	"""
@@ -204,7 +176,7 @@ class BufferGroup:
 	Each buffer runs via a separate daemon that loops at a set frequency.
 	"""
 
-	def __init__(self, processor: Processor, n: int, send_request: Callable[str, Request], max_process_wait=1.0, idle_interval: float = 0.5):
+	def __init__(self, processor: Processor, n: int, request_queue: Queue[Request], response_queue: Queue[Response], max_process_wait=1.0, idle_interval: float = 0.5):
 		"""
 		A group of Buffers that all use the same processor and thus produce the same outputs from the same inputs.
 
@@ -214,7 +186,8 @@ class BufferGroup:
 		Each buffer runs via a separate daemon that loops at a set frequency.
 		:param processor: The Processor to be used by all buffers in his group.
 		:param n: The number of buffers in this group.
-		:send_requests: A function which will accept requests created by the buffers in this group.
+		:param request_queue: A queue to send requests.
+		:param response_queue: A queue to send responses to requests.
 		:param max_process_wait: The maximum amount of time to wait for a request to be fulfilled.
 		:param idle_interval: The time in seconds to wait per loop for a buffer's daemon.
 		"""
@@ -227,17 +200,21 @@ class BufferGroup:
 		self.max_process_wait = max_process_wait
 		self.idle_interval = idle_interval
 
-		self.send_request = send_request
+		self.external_request_queue = request_queue
+		self.external_response_queue = response_queue
 
 		self.request_queue = Queue()
+		self.active_requests = {}
 		self.total_num_requests = 0
-		self.output_storage = Queue()
 
-		self.buffers = {self.name + "~" + str(i): Buffer(self.processor, i, self.output_storage.put, max_process_wait) for i in range(n)}
-		self.unrequested_buffers = Queue()
-		for name in self.buffers.keys():
-			self.unrequested_buffers.put(name)
-		self.requested_buffers = set()
+		self.output_storage = Queue()
+		self.response_queue = Queue()
+
+		self.manager = multiprocessing.get_context('fork').Manager()
+
+		self.available_buffers = Queue()
+		self.working_buffers = self.manager.set()
+		self.buffers = {self.name + "~" + str(i): Buffer(self.processor, i, self.output_storage, self.available_buffers, self.working_buffers, self.max_process_wait, self.idle_interval) for i in range(n)}
 
 		self.daemons: dict[str, multiprocessing.Process] = {}
 
@@ -248,14 +225,15 @@ class BufferGroup:
 		"""
 		n0 = self.n
 		self.n = n0 + n
+		ctx = multiprocessing.get_context('fork')
 		for i in range(n):
 			name = self.name + "~" + str(i + n0)
-			buffer =  Buffer(self.processor, n0 + i, self.output_storage.put, self.max_process_wait)
+			buffer =  Buffer(self.processor, n0 + i, self.output_storage, self.available_buffers, self.working_buffers, self.max_process_wait, self.idle_interval)
 			self.buffers[name] = buffer
-			self.unrequested_buffers.put(name)
+			self.available_buffers.put(name)
 			if not self.active:
 				continue
-			proc = multiprocessing.Process(target=buffer.working_loop, args = [self.idle_interval])
+			proc = ctx.Process(target=Buffer.run_working_loop, args = [buffer])
 			proc.start()
 			self.daemons[name] = proc
 
@@ -267,18 +245,18 @@ class BufferGroup:
 		:param max_join_wait: The maximum amount of time to wait for a daemon to join and terminate.
 		:return: If the buffers were successfully removed.
 		"""
-		if self.unrequested_buffers.qsize() < n:
+		if self.available_buffers.qsize() < n:
 			return False
 
 		for _ in range(n):
 			if self.request_queue.empty():
 				return False
 			self.n -= 1
-			buffer_name = self.unrequested_buffers.get()
+			buffer_name = self.available_buffers.get()
+			self.buffers[buffer_name].deactivate()
 			self.buffers.pop(buffer_name)
 			if not self.active:
 				continue
-			self.buffers[buffer_name].deactivate()
 			self.daemons[buffer_name].join(timeout=max_join_wait)
 			self.daemons[buffer_name].terminate()
 		return True
@@ -290,9 +268,9 @@ class BufferGroup:
 		if self.active:
 			return
 		self.active = True
+		ctx = multiprocessing.get_context('fork')
 		for name, buffer in self.buffers.items():
-			ctx = multiprocessing.get_context('fork')
-			proc = ctx.Process(target=buffer.working_loop, args=[self.idle_interval])
+			proc = ctx.Process(target=Buffer.run_working_loop, args=[buffer])
 			proc.start()
 			self.daemons[name] = proc
 
@@ -308,6 +286,43 @@ class BufferGroup:
 			proc.terminate()
 
 
+	def send_request(self, request: Request):
+		"""
+		Sends a request to the external request queue.
+		:param request: The request to be sent.
+		"""
+		self.external_request_queue.put(request)
+
+	def send_response(self, request: Request, token: Token):
+		"""
+		Fulfills a request with a token and sends both the request and the response to their respective external queues.
+		:param request: The request to fulfill.
+		:param token: The token to fulfill the request with.
+		"""
+		response = request.fulfill(token)
+		self.active_requests.pop(request.id)
+		self.external_request_queue.put(request)
+		self.external_response_queue.put(response)
+
+	def fulfill_active_requests(self) -> bool:
+		"""
+		Fulfills requests from the active requests queue until either the output storage or active requests queue is empty.
+		:return: False if there are no active requests or no tokens in output storage.
+		"""
+		if self.output_storage.empty() and len(self.active_requests) == 0:
+			return False
+		while not self.output_storage.empty() and len(self.active_requests) > 0:
+			token = self.output_storage.get()
+			if token.data is None:
+				if not self.available_buffers.empty():
+					self.send_buffer_requests(self.available_buffers.get())
+				else:
+					self.request_queue.put(Request.ghost())
+				continue
+			request = list(self.active_requests.values())[0]
+			self.send_response(request, token)
+		return True
+
 	def receive_request(self, request: Request):
 		"""
 		Receives an external request for the output of this group's processor. If there are overflow tokens in storage, will fulfill the
@@ -316,40 +331,31 @@ class BufferGroup:
 		"""
 		self.total_num_requests += 1
 		if not self.output_storage.empty():
-			request.fulfill(self.output_storage.get())
+			self.send_response(request, self.output_storage.get())
 			return
 		self.request_queue.put(request)
 
-	def assign_request(self) -> bool:
+	def assign_requests(self) -> bool:
 		"""
-		Assigns the first request in the request queue to the first available buffer.
-		:return: False if there are no requests in the requests queue or no available buffers.
+		Assigns as many requests from the request queue as possible to available buffers.
+		:return: False if there are no requests in the request queue or no available buffers.
 		"""
-		if self.request_queue.empty() or self.unrequested_buffers.empty():
+		if self.request_queue.empty() or self.available_buffers.empty():
 			return False
-		request = self.request_queue.get()
-		name = self.unrequested_buffers.get()
-		def remove_requested():
-			return self.remove_from_requested(name)
-		request.add_fulfilled_func(remove_requested)
-		self.requested_buffers.add(name)
-		self.buffers[name].push_request(request)
-		self.send_requests(name)
+		while not self.request_queue.empty() and not self.available_buffers.empty():
+			request = self.request_queue.get()
+			if request.id != -1:
+				self.active_requests[request.id] = request
+			if request.fulfilled:
+				if request.id in self.active_requests:
+					self.active_requests.pop(request.id)
+				continue
+			name = self.available_buffers.get()
+			self.working_buffers.add(name)
+			self.send_buffer_requests(name)
 		return True
 
-	def remove_from_requested(self, buffer_name: str) -> bool:
-		"""
-		Removes the buffer with the given name from the being requested.
-		:param buffer_name: The buffer name to remove from being requested.
-		:return: If the buffer with the given name could be removed.
-		"""
-		if buffer_name not in self.requested_buffers:
-			return False
-		self.requested_buffers.remove(buffer_name)
-		self.unrequested_buffers.put(buffer_name)
-		return True
-
-	def send_requests(self, buffer_name: str):
+	def send_buffer_requests(self, buffer_name: str):
 		"""
 		Sends a request for all missing inputs for the buffer with the given name.
 		:param buffer_name: The buffer name to send requests for.
@@ -357,23 +363,43 @@ class BufferGroup:
 		for arg in self.processor.dependant_args_map:
 			if arg in self.buffers[buffer_name].input_buffer:
 				continue
-			request = Request(self.buffers[buffer_name].receive_token)
-			for dep in self.processor.dependant_args_map[arg]:
-				self.send_request(dep, request)
+			request = Request.new(self.processor.dependant_args_map[arg], self.name)
+			self.send_request(request)
+
+	def receive_response(self, response: Response):
+		self.response_queue.put(response)
+
+	def push_responses(self) -> bool:
+		"""
+		Pushes all responses from the response queue to the appropriate buffers.
+		:return: If there were any responses in the response queue.
+		"""
+		if self.response_queue.empty():
+			return False
+		while not self.response_queue.empty():
+			response = self.response_queue.get()
+			self.buffers[response.target].receive_token(response.token)
+		return True
+
 
 	async def idle(self, idle_interval: float):
-		while self.request_queue.empty() or self.unrequested_buffers.empty():
-			if not self.active:
-				return
+		while (self.active
+				and (self.request_queue.empty() or self.available_buffers.empty())
+				and (self.output_storage.empty() or len(self.active_requests) == 0)
+				and self.response_queue.empty()):
 			await asyncio.sleep(idle_interval)
-		return
 
 	async def working_loop(self):
 		while self.active:
-			while not self.request_queue.empty() and not self.unrequested_buffers.empty():
-				self.assign_request()
+			self.assign_requests()
+			self.push_responses()
+			self.fulfill_active_requests()
 
 			await self.idle(self.idle_interval)
+
+	@staticmethod
+	def run_working_loop(buffer_group: BufferGroup):
+		asyncio.run(buffer_group.working_loop())
 
 	def get_analytics(self) -> dict:
 		"""
@@ -393,7 +419,7 @@ class BufferGroup:
 			"buffers": [
 				{
 					"count": buffer.count(),
-					"fill": float(buffer.count()) / buffer.size(),
+					"fill": 0 if buffer.size() == 0 else float(buffer.count()) / buffer.size(),
 					"storage": buffer.input_storage.qsize(),
 					"rate": buffer.get_process_rate()
 				}
