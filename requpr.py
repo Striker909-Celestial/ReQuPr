@@ -65,6 +65,7 @@ class ReQuPr:
 		if token.source not in self.incomplete_outputs:
 			return False
 		self.output_data[token.source].put(token.data)
+		print(f"ReQuPr: Pushed token to output from {token.source}, {self.output_data[token.source].qsize()}/{self.output_targets[token.source]}")
 		return True
 
 	def send_request(self, request: Request):
@@ -158,10 +159,10 @@ class ReQuPr:
 					name: output.qsize() for name, output in self.output_data.items()
 				}
 			}
-			print(f"requpr: {analytics}")
-			for name, buffer_group in self.buffer_groups.items():
-				print(name + ": " + str(buffer_group.get_analytics()))
-			print()
+			# print(f"requpr: {analytics}")
+			# for name, buffer_group in self.buffer_groups.items():
+			# 	print(name + ": " + str(buffer_group.get_analytics()))
+			# print()
 			await asyncio.sleep(idle_interval)
 
 	async def working_loop(self, output_request_batch_size: int = 5, max_join_wait: float = 1.0):

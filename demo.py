@@ -13,11 +13,11 @@ def mul(a, b):
 
 def main():
 	rand_processor = Processor("rand", rand, {"min": -10, "max": 11})
-	add_processor = Processor("add", add, {"a": "@rand|add|mul", "b": "@rand|add|mul"})
-	mul_processor = Processor("mul", mul, {"a": "@rand|add|mul", "b": "@rand|add|mul"})
+	add_processor = Processor("add", add, {"a": "@rand", "b": "@rand"})
+	mul_processor = Processor("mul", mul, {"a": "@rand", "b": "@rand"})
 
 	requpr = ReQuPr({"rand": rand_processor, "add": add_processor, "mul": mul_processor},
-				   {"rand": 4, "add": 2, "mul": 2}, {"add": 1000, "mul": 1000})
+				   {"rand": 4, "add": 2, "mul": 2}, {"add": 20, "mul": 20}, idle_interval=0.5)
 
 	requpr.start_daemons()
 	asyncio.run(requpr.working_loop(), debug=True)

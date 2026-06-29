@@ -43,6 +43,7 @@ class Request:
 		:return: A new request.
 		"""
 		cls.current_id += 1
+		print(f"Request {cls.current_id}: Created by {target}")
 		return cls(
 			id=Request.current_id,
 			sources=sources,
@@ -56,6 +57,7 @@ class Request:
 		Creates a "ghost" request that cannot generate a response and has the ID -1.
 		:return: A "ghost" request.
 		"""
+		print("Created ghost request")
 		return cls(id=-1, sources=set(), target="None", fulfilled=True)
 
 	def fulfill[_T](self, token: Token[_T]) -> None | Response[_T]:
@@ -66,6 +68,7 @@ class Request:
 		"""
 		if self.fulfilled:
 			return None
+		print(f"Request {self.id} from {self.target}: Fulfilled by {token.source}")
 		self.fulfilled = True
 		return Response(self.id, self.target, token)
 

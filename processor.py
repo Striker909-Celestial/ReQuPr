@@ -71,9 +71,10 @@ class Processor:
         :return: The output from the processor's function.
         """
         if len(self.dependencies) == 0:
-            return self.name, self.function(**self.function_kwargs)
+            return Token(self.name, self.function(**self.function_kwargs))
         if dependency_inputs is None:
-            return self.name, None
+            return Token(self.name, None)
         kwargs = self.function_kwargs.copy()
         kwargs.update(dependency_inputs)
-        return Token(self.name, self.function(**kwargs))
+        output = self.function(**kwargs)
+        return Token(self.name, output)

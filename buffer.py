@@ -35,6 +35,7 @@ class Buffer:
 
 		self.output_queue = output_queue
 		self.available_buffers_queue = available_buffers_queue
+		self.available_buffers_queue.put(self.name)
 		self.working_buffers_set = working_buffers_set
 
 		self.input_queue: Queue[Token] = Queue()
@@ -73,7 +74,7 @@ class Buffer:
 		self.current_dependencies_map = {key: val.copy() for key, val in self.processor.dependencies_map.items()}
 		output = Token(self.processor.name, None)
 		try:
-			output = func_timeout(self.max_process_wait, self.processor.process, self.input_buffer)
+			output = func_timeout(self.max_process_wait, self.processor.process, kwargs={"dependency_inputs": self.input_buffer})
 		except TimeoutError:
 			pass
 		self.num_calls += 1
@@ -81,6 +82,7 @@ class Buffer:
 		self.available_buffers_queue.put(self.name)
 		self.working_buffers_set.remove(self.name)
 		self.input_buffer = {}
+		print(f"Buffer {self.name}: Finished processing")
 		self.push_storage()
 		self.total_time += (datetime.datetime.now() - start).total_seconds()
 		return True
@@ -100,6 +102,7 @@ class Buffer:
 		:return: If the token was successfully pushed to the input buffer or storage.
 		"""
 		token_source = token.source
+		print(f"Buffer {self.name}: Pushing token from {token_source} into buffer")
 		if token_source not in self.current_dependencies:
 			# Puts the token into storage for a future operation if it is not currently necessary
 			self.input_storage.put(token)
@@ -330,8 +333,16 @@ class BufferGroup:
 		:param request: The request to be added to the requests queue.
 		"""
 		self.total_num_requests += 1
+		print(f"Buffer Group {self.name}: Received request from {request.target}")
+		if request.fulfilled:
+			if request.id in self.active_requests:
+				self.active_requests.pop(request.id)
+			return
 		if not self.output_storage.empty():
-			self.send_response(request, self.output_storage.get())
+			response = request.fulfill(self.output_storage.get())
+			if response is not None:
+				self.external_request_queue.put(request)
+				self.external_response_queue.put(response)
 			return
 		self.request_queue.put(request)
 
@@ -346,10 +357,6 @@ class BufferGroup:
 			request = self.request_queue.get()
 			if request.id != -1:
 				self.active_requests[request.id] = request
-			if request.fulfilled:
-				if request.id in self.active_requests:
-					self.active_requests.pop(request.id)
-				continue
 			name = self.available_buffers.get()
 			self.working_buffers.add(name)
 			self.send_buffer_requests(name)
@@ -363,11 +370,12 @@ class BufferGroup:
 		for arg in self.processor.dependant_args_map:
 			if arg in self.buffers[buffer_name].input_buffer:
 				continue
-			request = Request.new(self.processor.dependant_args_map[arg], self.name)
+			request = Request.new(self.processor.dependant_args_map[arg], buffer_name)
 			self.send_request(request)
 
 	def receive_response(self, response: Response):
 		self.response_queue.put(response)
+		print(f"Buffer Group {self.name}: Received response from {response.token.source}")
 
 	def push_responses(self) -> bool:
 		"""
@@ -418,6 +426,7 @@ class BufferGroup:
 			},
 			"buffers": [
 				{
+					"available": buffer.name not in self.working_buffers,
 					"count": buffer.count(),
 					"fill": 0 if buffer.size() == 0 else float(buffer.count()) / buffer.size(),
 					"storage": buffer.input_storage.qsize(),
